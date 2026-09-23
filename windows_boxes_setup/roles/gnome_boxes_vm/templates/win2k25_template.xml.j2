@@ -49,6 +49,8 @@
       <alias name='sata0-0-0'/>
       <address type='drive' controller='0' bus='0' target='0' unit='0'/>
     </disk>
+
+    <!-- Lecteur 1 : ISO Windows Server 2025 -->
     <disk type='file' device='cdrom'>
       <driver name='qemu'/>
       <source file='/home/green/root/Data/ISO/26100.32230.260111-0550.lt_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso'/>
@@ -57,6 +59,17 @@
       <alias name='sata0-0-2'/>
       <address type='drive' controller='0' bus='0' target='0' unit='2'/>
     </disk>
+
+    <!-- Lecteur 2 : Mini-ISO contenant Autounattend.xml -->
+    <disk type='file' device='cdrom'>
+      <driver name='qemu'/>
+      <source file='/home/green/.local/share/gnome-boxes/images/unattend_{{ vm_name }}.iso'/>
+      <target dev='hdd' bus='sata'/>
+      <readonly/>
+      <alias name='sata0-0-3'/>
+      <address type='drive' controller='0' bus='0' target='0' unit='3'/>
+    </disk>
+
     <controller type='usb' index='0' model='qemu-xhci' ports='15'>
       <alias name='usb'/>
       <address type='pci' domain='0x0000' bus='0x03' slot='0x00' function='0x0'/>

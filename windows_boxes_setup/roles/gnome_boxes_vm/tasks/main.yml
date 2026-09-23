@@ -1,34 +1,56 @@
 ---
-- name: Ensure GNOME Boxes images directory exists
+- name: S'assurer que le répertoire d'images GNOME Boxes existe
   ansible.builtin.file:
     path: "/home/green/.local/share/gnome-boxes/images"
     state: directory
     mode: '0755'
 
-- name: Create qcow2 disk image for the VM
+- name: Créer le dossier temporaire de préparation d'unattended
+  ansible.builtin.file:
+    path: "/tmp/unattend_{{ vm_name }}"
+    state: directory
+    mode: '0755'
+
+- name: Générer le fichier Autounattend.xml
+  ansible.builtin.template:
+    src: autounattend.xml.j2
+    dest: "/tmp/unattend_{{ vm_name }}/Autounattend.xml"
+    mode: '0644'
+
+- name: Créer la mini-ISO de réponse pour Windows
+  ansible.builtin.command:
+    cmd: "genisoimage -J -r -o /home/green/.local/share/gnome-boxes/images/unattend_{{ vm_name }}.iso /tmp/unattend_{{ vm_name }}"
+    creates: "/home/green/.local/share/gnome-boxes/images/unattend_{{ vm_name }}.iso"
+
+- name: Nettoyer le dossier temporaire d'unattended
+  ansible.builtin.file:
+    path: "/tmp/unattend_{{ vm_name }}"
+    state: absent
+
+- name: Créer l'image disque qcow2 vierge
   ansible.builtin.command:
     cmd: "qemu-img create -f qcow2 /home/green/.local/share/gnome-boxes/images/{{ vm_name }} 60G"
     creates: "/home/green/.local/share/gnome-boxes/images/{{ vm_name }}"
 
-- name: Generate libvirt XML configuration from template
+- name: Générer la configuration XML libvirt
   ansible.builtin.template:
     src: win2k25_template.xml.j2
     dest: "/tmp/{{ vm_name }}.xml"
     mode: '0644'
 
-- name: Define the VM in libvirt
+- name: Définir la VM dans libvirt (session utilisateur)
   ansible.builtin.command:
-    cmd: "virsh define /tmp/{{ vm_name }}.xml"
+    cmd: "virsh --connect qemu:///session define /tmp/{{ vm_name }}.xml"
   register: virsh_define
-  changed_when: "'Domain' in virsh_define.stdout and 'defined from' in virsh_define.stdout"
+  changed_when: "'defined from' in virsh_define.stdout"
 
-- name: Start the VM to reach the interactive installation
+- name: Démarrer la VM
   ansible.builtin.command:
-    cmd: "virsh start {{ vm_name }}"
+    cmd: "virsh --connect qemu:///session start {{ vm_name }}"
   register: virsh_start
-  changed_when: "'Domain' in virsh_start.stdout and 'started' in virsh_start.stdout"
+  changed_when: "'started' in virsh_start.stdout"
 
-- name: Clean up temporary XML file
+- name: Supprimer le fichier XML temporaire
   ansible.builtin.file:
     path: "/tmp/{{ vm_name }}.xml"
     state: absent
