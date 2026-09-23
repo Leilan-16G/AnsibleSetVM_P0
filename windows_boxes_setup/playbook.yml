@@ -1,0 +1,14 @@
+---
+- name: Provision Windows Server 2025 in GNOME Boxes
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_prompt:
+    - name: vm_name
+      prompt: "Enter the VM name (e.g., win2k25-3)"
+      private: false
+    - name: vm_title
+      prompt: "Enter the VM title (e.g., Win25-2026-3)"
+      private: false
+  roles:
+    - gnome_boxes_vm
