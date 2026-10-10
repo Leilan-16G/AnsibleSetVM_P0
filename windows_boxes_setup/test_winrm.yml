@@ -1,0 +1,26 @@
+---
+- name: Valider l'accès WinRM sur la VM Windows Server
+  hosts: localhost
+  gather_facts: false
+  vars_prompt:
+    - name: vm_ip
+      prompt: "Entrez l'adresse IP de la VM Windows"
+      private: false
+
+  tasks:
+    - name: 1. Attendre l'ouverture du port TCP 5985
+      ansible.builtin.wait_for:
+        host: "{{ vm_ip }}"
+        port: 5985
+        state: started
+        delay: 2
+        timeout: 60
+
+    - name: 2. Exécuter un win_ping via WinRM
+      ansible.builtin.win_ping:
+      delegate_to: "{{ vm_ip }}"
+      vars:
+        ansible_user: Administrator
+        ansible_password: "Bonjour$123"
+        ansible_connection: winrm
+        ansible_winrm_server_cert_validation: ignore

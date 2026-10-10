@@ -1,9 +1,22 @@
----
 - name: S'assurer que le répertoire d'images GNOME Boxes existe
   ansible.builtin.file:
-    path: "/home/green/.local/share/gnome-boxes/images"
+    path: "{{ lookup('env', 'HOME') }}/.local/share/gnome-boxes/images"
     state: directory
     mode: '0755'
+
+- name: Arrêter et supprimer la VM existante si elle est déjà définie
+  ansible.builtin.shell: |
+    virsh --connect qemu:///session destroy {{ vm_name }} || true
+    virsh --connect qemu:///session undefine {{ vm_name }} || true
+  changed_when: false
+
+- name: Nettoyer l'ancienne ISO unattend et l'image disque
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ lookup('env', 'HOME') }}/.local/share/gnome-boxes/images/unattend_{{ vm_name }}.iso"
+    - "{{ lookup('env', 'HOME') }}/.local/share/gnome-boxes/images/{{ vm_name }}"
 
 - name: Créer le dossier temporaire de préparation d'unattended
   ansible.builtin.file:
@@ -19,8 +32,7 @@
 
 - name: Créer la mini-ISO de réponse pour Windows
   ansible.builtin.command:
-    cmd: "genisoimage -J -r -o /home/green/.local/share/gnome-boxes/images/unattend_{{ vm_name }}.iso /tmp/unattend_{{ vm_name }}"
-    creates: "/home/green/.local/share/gnome-boxes/images/unattend_{{ vm_name }}.iso"
+    cmd: "genisoimage -J -r -o {{ lookup('env', 'HOME') }}/.local/share/gnome-boxes/images/unattend_{{ vm_name }}.iso /tmp/unattend_{{ vm_name }}"
 
 - name: Nettoyer le dossier temporaire d'unattended
   ansible.builtin.file:
@@ -29,8 +41,7 @@
 
 - name: Créer l'image disque qcow2 vierge
   ansible.builtin.command:
-    cmd: "qemu-img create -f qcow2 /home/green/.local/share/gnome-boxes/images/{{ vm_name }} 60G"
-    creates: "/home/green/.local/share/gnome-boxes/images/{{ vm_name }}"
+    cmd: "qemu-img create -f qcow2 {{ lookup('env', 'HOME') }}/.local/share/gnome-boxes/images/{{ vm_name }} 60G"
 
 - name: Générer la configuration XML libvirt
   ansible.builtin.template:
@@ -54,3 +65,45 @@
   ansible.builtin.file:
     path: "/tmp/{{ vm_name }}.xml"
     state: absent
+
+- name: Récupérer l'adresse MAC de la VM
+  ansible.builtin.shell: |
+    virsh --connect qemu:///session dumpxml {{ vm_name }} | awk -F"'" '/mac address/ {print $2; exit}'
+  register: vm_mac_output
+  changed_when: false
+
+- name: Attendre l'attribution de l'adresse IP dans dnsmasq
+  ansible.builtin.shell: |
+    MAC="{{ vm_mac_output.stdout | lower }}"
+    IP=""
+
+    for status_file in /var/lib/libvirt/dnsmasq/*.status; do
+      if [ -f "$status_file" ]; then
+        IP=$(grep -B 2 -i "$MAC" "$status_file" 2>/dev/null | grep "ip-address" | cut -d'"' -f4)
+        [ -n "$IP" ] && break
+      fi
+    done
+
+    echo "$IP"
+  register: vm_ip_output
+  until: vm_ip_output.stdout != ""
+  retries: 60
+  delay: 10
+  changed_when: false
+  become: true
+
+- name: Enregistrer l'IP de la VM
+  ansible.builtin.set_fact:
+    vm_ip: "{{ vm_ip_output.stdout }}"
+
+- name: Afficher l'adresse IP obtenue
+  ansible.builtin.debug:
+    msg: "La VM {{ vm_name }} (MAC: {{ vm_mac_output.stdout }}) est accessible sur l'IP : {{ vm_ip }}"
+
+- name: Attendre l'ouverture du port WinRM (5985)
+  ansible.builtin.wait_for:
+    host: "{{ vm_ip }}"
+    port: 5985
+    state: started
+    delay: 5
+    timeout: 300
