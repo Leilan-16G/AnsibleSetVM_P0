@@ -1,0 +1,383 @@
+---
+- name: Post-configuration de la VM Windows Server 2025
+  hosts: windows_vms
+  gather_facts: false
+  vars_prompt:
+    - name: vm_ip
+      prompt: "Entrez l'adresse IP de la VM Windows"
+      private: false
+    - name: vm_name
+      prompt: "Entrez le nom de la VM dans libvirt"
+      default: "win2k25-2"
+      private: false
+    - name: common_password
+      prompt: "Entrez le mot de passe unique pour Administrator, blue et green"
+      private: true
+      confirm: true
+
+  tasks:
+    # =========================================================================
+    # PARTIE 1 : ACTIONS SUR L'HÔTE FEDORA (Génération ISO, XML & Montage)
+    # =========================================================================
+    - name: Générer l'ISO des binaires logiciels sur l'hôte Fedora
+      delegate_to: localhost
+      become: false
+      ansible.builtin.command:
+        cmd: "genisoimage -r -J -o /home/green/root/Data/ISO/WinServSoftInstall_CD.iso /home/green/root/Data/ISO/WinServSoftInstall_CD"
+      changed_when: true
+
+    - name: Créer le dossier de partage /tmp/wrk sur l'hôte
+      delegate_to: localhost
+      become: true
+      ansible.builtin.file:
+        path: "/tmp/wrk"
+        state: directory
+        mode: '0755'
+
+    - name: S'assurer que le canal WebDAV Spice est présent dans le XML de la VM libvirt
+      delegate_to: localhost
+      become: false
+      ansible.builtin.shell: |
+        xml_file="/tmp/wrk/{{ vm_name }}_domain.xml"
+        virsh --connect qemu:///session dumpxml {{ vm_name }} > "$xml_file"
+        
+        if ! grep -q "org.spice-space.webdav.0" "$xml_file"; then
+            python3 -c "
+            import xml.etree.ElementTree as ET
+            tree = ET.parse('$xml_file')
+            root = tree.getroot()
+            devices = root.find('devices')
+            if devices is not None:
+                channel = ET.Element('channel', attrib={'type': 'spicevmc'})
+                ET.SubElement(channel, 'target', attrib={'type': 'virtio', 'name': 'org.spice-space.webdav.0'})
+                tree.write('$xml_file', encoding='utf-8', xml_declaration=True)
+            "
+            virsh --connect qemu:///session define "$xml_file"
+            echo "CHANGED"
+        else
+            echo "OK"
+        fi
+      register: xml_check
+      changed_when: "'CHANGED' in xml_check.stdout"
+
+    - name: Redémarrer la VM sur l'hôte pour initialiser le canal WebDAV libvirt si modifié
+      delegate_to: localhost
+      become: false
+      ansible.builtin.shell: |
+        if [ "{{ xml_check.changed }}" = "True" ]; then
+            virsh --connect qemu:///session destroy {{ vm_name }} || true
+            virsh --connect qemu:///session start {{ vm_name }}
+            sleep 10
+        fi
+      changed_when: xml_check.changed
+
+    - name: Attacher l'ISO logicielle au lecteur CD de la VM (libvirt session)
+      delegate_to: localhost
+      become: false
+      ansible.builtin.command:
+        cmd: "virsh --connect qemu:///session change-media {{ vm_name }} hdc /home/green/root/Data/ISO/WinServSoftInstall_CD.iso --config --live"
+      changed_when: true
+
+    # =========================================================================
+    # PARTIE 2 : CONNEXION INITIALE EN TANT QU'ADMINISTRATEUR
+    # =========================================================================
+    - name: Configuration initiale en tant qu'Administrator
+      block:
+        - name: Configurer les accès WinRM avec des timeouts accrus
+          ansible.builtin.set_fact:
+            ansible_host: "{{ vm_ip }}"
+            ansible_user: "Administrator"
+            ansible_password: "{{ common_password }}"
+            ansible_connection: "winrm"
+            ansible_winrm_port: 5985
+            ansible_winrm_scheme: http
+            ansible_winrm_transport: basic
+            ansible_winrm_server_cert_validation: "ignore"
+            ansible_winrm_read_timeout: 70
+            ansible_winrm_operation_timeout: 60
+
+        - name: Renommer le PC en Win25
+          ansible.windows.win_hostname:
+            name: "Win25"
+          register: hostname_change
+
+        - name: Configurer la région (French - France) et le TimeZone (Paris)
+          ansible.windows.win_timezone:
+            timezone: "Romance Standard Time"
+
+        - name: Lancer les mises à jour Windows Update initiales
+          ansible.windows.win_updates:
+            category_names: ['SecurityUpdates', 'CriticalUpdates']
+            reboot: true
+          register: win_updates
+
+        - name: Redémarrer si le changement de nom l'exige
+          ansible.windows.win_reboot:
+            msg: "Redémarrage requis suite au changement de nom du PC"
+          when: hostname_change.changed
+
+        - name: Créer l'utilisateur "blue" (Groupe Administrateurs)
+          ansible.windows.win_user:
+            name: "blue"
+            fullname: "Mr. Blue"
+            password: "{{ common_password }}"
+            groups:
+              - Administrators
+            password_never_expires: true
+            state: present
+
+        - name: Créer l'utilisateur "green" (Sans groupe administrateur)
+          ansible.windows.win_user:
+            name: "green"
+            fullname: "Mr. Green"
+            password: "{{ common_password }}"
+            password_never_expires: true
+            state: present
+      rescue:
+        - name: Erreur lors de la configuration administrateur
+          ansible.builtin.fail:
+            msg: "La configuration initiale a échoué. Vérifiez l'IP et les identifiants."
+
+    # =========================================================================
+    # PARTIE 3 : CONFIGURATION VIA LE COMPTE BLUE (Spice, WebDAV, Mappage Z:)
+    # =========================================================================
+    - name: Configuration de l'intégration et du WebDAV avec le compte blue
+      block:
+        - name: Réinitialiser la connexion avec l'utilisateur blue
+          ansible.builtin.set_fact:
+            ansible_user: "blue"
+
+        - name: Créer le répertoire de téléchargement local
+          ansible.windows.win_file:
+            path: "C:\\Users\\blue\\Documents\\Downloads\\Install"
+            state: directory
+
+        - name: Créer le script PowerShell de copie du CD cible
+          ansible.windows.win_copy:
+            content: |
+              $cdrom = Get-PSDrive -PSProvider FileSystem | Where-Object { Test-Path ("{0}:\Spice" -f $_.Name) } | Select-Object -ExpandProperty Root
+              if ($cdrom) {
+                  Copy-Item -Path "$cdrom\*" -Destination "C:\Users\blue\Documents\Downloads\Install" -Recurse -Force
+              } else {
+                  throw "Le CD d'installation logiciel introuvable."
+              }
+            dest: "C:\\Windows\\Temp\\copy_cd.ps1"
+
+        - name: Copier le contenu du CD d'installation vers le dossier local
+          ansible.windows.win_command: "powershell.exe -ExecutionPolicy Bypass -File C:\\Windows\\Temp\\copy_cd.ps1"
+          changed_when: true
+
+        - name: Installer les Spice Guest Tools (Exécutable)
+          ansible.windows.win_package:
+            path: "C:\\Users\\blue\\Documents\\Downloads\\Install\\Spice\\spice-guest-tools-latest.exe"
+            arguments: "/S"
+            state: present
+
+        - name: Redémarrer la VM après l'installation des Spice Guest Tools
+          ansible.windows.win_reboot:
+            msg: "Redémarrage requis pour initialiser les pilotes et services Spice"
+
+        - name: Désinstaller et réinstaller proprement le MSI Spice WebDAV pour forcer la liaison avec le canal virtio
+          ansible.windows.win_shell: |
+            $msiPath = "C:\Users\blue\Documents\Downloads\Install\Spice\spice-webdavd-x64-latest.msi"
+            $installedMsi = Get-WmiObject -Class Win32_Product \vert{} Where-Object {$_.Name -like "*Spice webdav*" }
+            if ($installedMsi) {$installedMsi.Uninstall() | Out-Null
+            }
+            Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /quiet /norestart" -Wait
+          changed_when: true
+
+        - name: Activer la fonctionnalité WebDAV-Redirector via DISM
+          ansible.windows.win_feature:
+            name: "WebDAV-Redirector"
+            state: present
+            include_sub_features: true
+            include_management_tools: true
+          register: dism_webdav
+
+        - name: Redémarrer après l'activation de WebDAV
+          ansible.windows.win_reboot:
+            msg: "Redémarrage requis pour activer WebDAV Redirector"
+          when: dism_webdav.reboot_required
+
+        - name: Forcer le démarrage et le mode automatique des services Spice et WebDAV
+          ansible.windows.win_shell: |
+            Get-Service | Where-Object { $_.DisplayName -like "*Spice*" -or $_.Name -like "*webdav*" -or $_.Name -eq "WebClient" } | ForEach-Object {
+                Set-Service -Name $_.Name -StartupType Automatic
+                if ($_.Status -ne 'Running') {
+                    Start-Service -Name $_.Name -ErrorAction SilentlyContinue
+                }
+            }
+          changed_when: true
+
+        - name: Configurer WebClient pour autoriser l'authentification Basic sur HTTP (non-SSL)
+          ansible.windows.win_regedit:
+            path: HKLM:\SYSTEM\CurrentControlSet\Services\WebClient\Parameters
+            name: BasicAuthLevel
+            data: 2
+            type: dword
+            state: present
+
+        - name: Ajouter localhost et 127.0.0.1 à AuthForwardServerList pour WebDAV
+          ansible.windows.win_regedit:
+            path: HKLM:\SYSTEM\CurrentControlSet\Services\WebClient\Parameters
+            name: AuthForwardServerList
+            data:
+              - "localhost"
+              - "localhost:9843"
+              - "127.0.0.1"
+              - "127.0.0.1:9843"
+            type: multistring
+            state: present
+
+        - name: Redémarrer le service WebClient pour appliquer les modifications registre
+          ansible.windows.win_service:
+            name: "WebClient"
+            state: restarted
+
+        - name: Redémarrer le service Spice webdav proxy pour activer l'écoute sur le port 9843
+          ansible.windows.win_shell: |
+            Restart-Service -Name "*webdav*" -Force
+          changed_when: true
+
+        - name: "Attendre que le serveur WebDAV local réponde et mapper le lecteur Z: via WScript.Network"
+          ansible.windows.win_shell: |
+            $maxRetries = 15;
+            $retryInterval = 4;
+            $success =$false;
+
+            for ($i = 1; $i -le $maxRetries; $i++) {
+                try {
+                    $response = Invoke-WebRequest -Uri "http://localhost:9843/" -UseBasicParsing -TimeoutSec 2;
+                    if ($response.StatusCode -lt 500) {
+                        $success =$true;
+                        break;
+                    }
+                } catch {
+                    Write-Host "Tentative $i/$maxRetries : En attente du service WebDAV Spice..."
+                }
+                Start-Sleep -Seconds $retryInterval;
+            }
+
+            if (-not $success) {
+                throw "Le serveur WebDAV local (port 9843) ne répond pas après plusieurs tentatives."
+            }
+
+            $net = New-Object -ComObject WScript.Network;
+            try {
+                $net.MapNetworkDrive("Z:", "http://localhost:9843/")
+            } catch {
+                if ($_.Exception.Message -notlike "*already exists*") {
+                    throw $_
+                }
+            }
+          register: map_result
+          changed_when: true
+      rescue:
+        - name: Échec des tâches sous le compte blue
+          ansible.builtin.fail:
+            msg: "Une erreur est survenue lors des actions avec le compte blue."
+
+    # =========================================================================
+    # PARTIE 4 : DÉPLOIEMENT DES LOGICIELS VIA LE COMPTE GREEN
+    # =========================================================================
+    - name: Installation des logiciels et de MSYS2 sous le compte green
+      block:
+        - name: Basculer la connexion sur l'utilisateur green
+          ansible.builtin.set_fact:
+            ansible_user: "green"
+
+        - name: Créer le script PowerShell pour copier le dossier Util
+          ansible.windows.win_copy:
+            content: |
+              $source = "C:\Users\blue\Documents\Downloads\Install\Util"
+              $dest = "C:\Users\green\Desktop\Util"
+              if (Test-Path $source) {
+                  Copy-Item -Path $source -Destination$dest -Recurse -Force
+              }
+            dest: "C:\\Windows\\Temp\\copy_util.ps1"
+
+        - name: Déposer le contenu du dossier Util directement sur le Bureau de Green
+          ansible.windows.win_command: "powershell.exe -ExecutionPolicy Bypass -File C:\\Windows\\Temp\\copy_util.ps1"
+          changed_when: true
+
+        - name: Créer le répertoire d'application MSYS2
+          ansible.windows.win_file:
+            path: "C:\\Users\\green\\Application\\MSYS2"
+            state: directory
+
+        - name: Installer MSYS2 silencieusement
+          ansible.windows.win_package:
+            path: "C:\\Users\\blue\\Documents\\Downloads\\Install\\Util\\msys2-x86_64-20250830.exe"
+            arguments: "--anchored --confirm-command --accept-messages --root C:\\Users\\green\\Application\\MSYS2"
+            state: present
+
+        - name: Installer Firefox
+          ansible.windows.win_package:
+            path: "C:\\Users\\blue\\Documents\\Downloads\\Install\\Firefox Installer.exe"
+            arguments: "-ms"
+            state: present
+
+        - name: Installer Google Chrome
+          ansible.windows.win_package:
+            path: "C:\\Users\\blue\\Documents\\Downloads\\Install\\ChromeSetup.exe"
+            arguments: "/silent /install"
+            state: present
+
+        - name: Installer Adobe Reader
+          ansible.windows.win_package:
+            path: "C:\\Users\\blue\\Documents\\Downloads\\Install\\Reader_fr_install.exe"
+            arguments: "/sAll /rs"
+            state: present
+
+        - name: Installer PDFCreator
+          ansible.windows.win_package:
+            path: "C:\\Users\\blue\\Documents\\Downloads\\Install\\PDFCreator-5_3_1-Setup.exe"
+            arguments: "/VERYSILENT /NORESTART /SP-"
+            state: present
+
+        - name: Installer OpenOffice
+          ansible.windows.win_package:
+            path: "C:\\Users\\blue\\Documents\\Downloads\\Install\\Apache_OpenOffice_4.1.15_Win_x86_install_en-US.exe"
+            arguments: "/quiet /norestart"
+            state: present
+
+        - name: Installer VLC
+          ansible.windows.win_package:
+            path: "C:\\Users\\blue\\Documents\\Downloads\\Install\\vlc-3.0.21-win64.exe"
+            arguments: "/S"
+            state: present
+
+        - name: Installer VeraCrypt
+          ansible.windows.win_package:
+            path: "C:\\Users\\blue\\Documents\\Downloads\\Install\\VeraCrypt Setup 1.25.9.exe"
+            arguments: "/verysilent /norestart /suppressmsgboxes"
+            state: present
+
+        - name: Installer Notepad++
+          ansible.windows.win_package:
+            path: "C:\\Users\\blue\\Documents\\Downloads\\Install\\npp.8.6.9.Installer.x64.exe"
+            arguments: "/S"
+            state: present
+      rescue:
+        - name: Échec de l'installation des logiciels
+          ansible.builtin.fail:
+            msg: "Une erreur est survenue lors de l'installation des applications pour green."
+
+    # =========================================================================
+    # PARTIE 5 : FINALISATION (Désactivation du compte Administrator)
+    # =========================================================================
+    - name: Finalisation et désactivation du compte Administrator
+      block:
+        - name: Revenir au compte Administrator pour la désactivation
+          ansible.builtin.set_fact:
+            ansible_user: "Administrator"
+
+        - name: Désactiver définitivement le compte Administrator natif
+          ansible.windows.win_user:
+            name: "Administrator"
+            disabled: true
+            state: present
+      rescue:
+        - name: Erreur lors de la désactivation d'Administrator
+          ansible.builtin.fail:
+            msg: "Impossible de désactiver le compte Administrator."

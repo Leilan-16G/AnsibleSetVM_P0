@@ -10,5 +10,9 @@
     - name: vm_title
       prompt: "Enter the VM title (e.g., Win25-2026-3)"
       private: false
+    - name: admin_password
+      prompt: "Enter the Windows Administrator password"
+      private: true
+      confirm: true
   roles:
     - gnome_boxes_vm
